@@ -1,0 +1,1 @@
+vless://11111111-2222-4333-8444-555555555555@vpn.example.test:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=cdn.example.test&fp=firefox&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef&type=tcp#Example-Reality

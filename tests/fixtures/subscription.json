@@ -1,0 +1,35 @@
+[
+  {
+    "remarks": "Example subscription",
+    "outbounds": [
+      {
+        "tag": "Example Reality 1",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vpn.example.test",
+              "port": 443,
+              "users": [
+                {
+                  "id": "11111111-2222-4333-8444-555555555555",
+                  "flow": "xtls-rprx-vision"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "cdn.example.test",
+            "fingerprint": "firefox",
+            "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "shortId": "0123456789abcdef"
+          }
+        }
+      }
+    ]
+  }
+]

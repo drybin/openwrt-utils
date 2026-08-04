@@ -1,0 +1,129 @@
+#!/bin/ash
+# Diagnose and configure dnsmasq DNS on OpenWrt.
+set -u
+
+MODE=check
+APPLY=0
+SERVERS=''
+DISABLE_PEERDNS=0
+FORCE_LAN_DNS=0
+BLOCK_DOT=0
+TEST_DOMAIN=openwrt.org
+
+log() { printf '%s\n' "$*"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "не найдена команда $1"; }
+run() { if [ "$APPLY" = 1 ]; then "$@"; else printf '+ '; printf '%s ' "$@"; printf '\n'; fi; }
+usage() {
+    cat <<EOF
+Использование:
+  $0 check [--test-domain DOMAIN]
+  $0 configure --servers 1.1.1.1,9.9.9.9 [--disable-wan-peerdns] [--force-lan-dns] [--block-dot] [--apply]
+
+Без --apply команда configure только показывает план.
+EOF
+}
+
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        check|configure) MODE=$1; shift;;
+        -h|--help) usage; exit 0;;
+        *) die "неизвестный режим: $1";;
+    esac
+fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --servers) SERVERS=$2; shift 2;;
+        --disable-wan-peerdns) DISABLE_PEERDNS=1; shift;;
+        --force-lan-dns) FORCE_LAN_DNS=1; shift;;
+        --block-dot) BLOCK_DOT=1; shift;;
+        --test-domain) TEST_DOMAIN=$2; shift 2;;
+        --apply) APPLY=1; shift;;
+        -h|--help) usage; exit 0;;
+        *) die "неизвестный параметр: $1";;
+    esac
+done
+
+need uci
+check_dns() {
+    log '=== DNSMASQ ==='
+    uci -q show dhcp.@dnsmasq[0] || true
+    log ''; log '=== WAN DNS ==='
+    uci -q get network.wan.peerdns 2>/dev/null | sed 's/^/peerdns: /' || log 'peerdns: default'
+    uci -q get network.wan.dns 2>/dev/null | sed 's/^/static DNS: /' || true
+    log ''; log '=== ACTIVE RESOLVERS ==='
+    for file in /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto /etc/resolv.conf; do
+        [ -r "$file" ] && { log "$file"; sed -n '/^[[:space:]]*nameserver/p' "$file"; }
+    done
+    log ''; log '=== LOOKUP ==='
+    if command -v nslookup >/dev/null 2>&1; then nslookup "$TEST_DOMAIN" || return 1; else log 'nslookup не найден'; return 1; fi
+    log ''; log '=== HOMEPROXY DNS ==='
+    uci -q show homeproxy | grep -E 'dns|redirect' || log 'HomeProxy DNS-параметры не найдены'
+    log ''; log 'Примечание: этот тест видит системные DNS, но не может надёжно обнаружить DNS-over-HTTPS приложений.'
+}
+
+configure_dns() {
+    [ -n "$SERVERS" ] || die 'требуется --servers IP[,IP]'
+    [ "$APPLY" = 0 ] || [ "$(id -u)" = 0 ] || die '--apply требует root'
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="/etc/config/dhcp.bak-$stamp"
+    network_backup="/etc/config/network.bak-$stamp"
+    firewall_backup="/etc/config/firewall.bak-$stamp"
+    if [ "$APPLY" = 1 ]; then
+        cp /etc/config/dhcp "$backup" || die 'не удалось создать backup DHCP'
+        [ "$DISABLE_PEERDNS" = 1 ] && cp /etc/config/network "$network_backup"
+        if [ "$FORCE_LAN_DNS" = 1 ] || [ "$BLOCK_DOT" = 1 ]; then cp /etc/config/firewall "$firewall_backup" || die 'не удалось создать backup firewall'; fi
+    fi
+    restore_all() {
+        [ -f "$backup" ] && cp "$backup" /etc/config/dhcp
+        [ -f "$network_backup" ] && cp "$network_backup" /etc/config/network
+        [ -f "$firewall_backup" ] && cp "$firewall_backup" /etc/config/firewall
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+        /etc/init.d/network reload >/dev/null 2>&1 || true
+        /etc/init.d/firewall restart >/dev/null 2>&1 || true
+    }
+    run uci set 'dhcp.@dnsmasq[0].noresolv=1'
+    run uci -q delete 'dhcp.@dnsmasq[0].server'
+    old_ifs=$IFS; IFS=','
+    for server in $SERVERS; do
+        echo "$server" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:]+$' || die "некорректный DNS: $server"
+        run uci add_list "dhcp.@dnsmasq[0].server=$server"
+    done
+    IFS=$old_ifs
+    if [ "$DISABLE_PEERDNS" = 1 ]; then run uci set 'network.wan.peerdns=0'; run uci -q delete 'network.wan.dns'; fi
+    if [ "$FORCE_LAN_DNS" = 1 ]; then
+        run uci set 'firewall.force_lan_dns=redirect'
+        run uci set 'firewall.force_lan_dns.name=Force-LAN-DNS'
+        run uci set 'firewall.force_lan_dns.src=lan'
+        run uci set 'firewall.force_lan_dns.src_dport=53'
+        run uci set 'firewall.force_lan_dns.proto=tcp udp'
+        run uci set 'firewall.force_lan_dns.target=DNAT'
+    fi
+    if [ "$BLOCK_DOT" = 1 ]; then
+        run uci set 'firewall.block_lan_dot=rule'
+        run uci set 'firewall.block_lan_dot.name=Block-LAN-DoT'
+        run uci set 'firewall.block_lan_dot.src=lan'
+        run uci set 'firewall.block_lan_dot.dest=wan'
+        run uci set 'firewall.block_lan_dot.dest_port=853'
+        run uci set 'firewall.block_lan_dot.proto=tcp udp'
+        run uci set 'firewall.block_lan_dot.target=REJECT'
+    fi
+    run uci commit dhcp
+    [ "$DISABLE_PEERDNS" = 1 ] && run uci commit network
+    if [ "$FORCE_LAN_DNS" = 1 ] || [ "$BLOCK_DOT" = 1 ]; then run uci commit firewall; fi
+    if [ "$APPLY" = 1 ]; then
+        /etc/init.d/dnsmasq restart || { restore_all; die 'dnsmasq не запустился, конфигурация восстановлена'; }
+        if [ "$DISABLE_PEERDNS" = 1 ]; then /etc/init.d/network reload || { restore_all; die 'network reload завершился ошибкой, конфигурация восстановлена'; }; fi
+        if [ "$FORCE_LAN_DNS" = 1 ] || [ "$BLOCK_DOT" = 1 ]; then /etc/init.d/firewall restart || { restore_all; die 'firewall не запустился, конфигурация восстановлена'; }; fi
+        sleep 1
+        if command -v nslookup >/dev/null 2>&1 && ! nslookup "$TEST_DOMAIN" >/dev/null 2>&1; then
+            restore_all
+            die 'DNS-проверка не прошла, конфигурация DHCP восстановлена'
+        fi
+        log "DNS настроен. Backup: $backup"
+    else
+        log 'Dry-run: изменений нет. Проверьте план и повторите с --apply.'
+    fi
+}
+
+case "$MODE" in check) check_dns;; configure) configure_dns;; *) usage; exit 2;; esac

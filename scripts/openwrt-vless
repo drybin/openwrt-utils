@@ -1,0 +1,266 @@
+#!/bin/ash
+# VLESS Reality benchmark and HomeProxy helper for OpenWrt/BusyBox.
+set -u
+
+SUB_FILE=''
+SUB_URL=''
+TEST_URL='https://detectportal.firefox.com/success.txt'
+MAX_NODES=0
+BASE_PORT=18080
+MODE=benchmark
+NODE_INDEX=''
+SECTION=vless_auto
+WORK_DIR="/tmp/openwrt-vless.$$"
+RAW="$WORK_DIR.raw"
+TEXT="$WORK_DIR.txt"
+NODES="$WORK_DIR.nodes"
+RESULTS="$WORK_DIR.results"
+TAB=$(printf '\t')
+SB_PID=''
+
+log() { printf '%s\n' "$*"; }
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "не найдена команда $1"; }
+cleanup() {
+    [ -n "$SB_PID" ] && kill "$SB_PID" >/dev/null 2>&1 || true
+    rm -f "$RAW" "$TEXT" "$NODES" "$NODES.raw" "$NODES.ok" "$RESULTS" "$WORK_DIR".*.json "$WORK_DIR".*.log
+}
+trap cleanup EXIT INT TERM
+
+usage() {
+    cat <<EOF
+Использование:
+  $0 -f subscription.sub [--benchmark] [--max N]
+  $0 -u URL --manual [--node N]
+  $0 -f subscription.sub --uci --node N [--section NAME]
+  $0 -f subscription.sub --apply --node N [--section NAME]
+
+Режимы: --list, --benchmark, --manual, --uci, --apply.
+Для --apply создаётся backup /etc/config/homeproxy.bak-DATE.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -f|--file) SUB_FILE=$2; shift 2;;
+        -u|--url) SUB_URL=$2; shift 2;;
+        --test-url) TEST_URL=$2; shift 2;;
+        --max) MAX_NODES=$2; shift 2;;
+        --node) NODE_INDEX=$2; shift 2;;
+        --section) SECTION=$2; shift 2;;
+        --list) MODE=list; shift;;
+        --benchmark) MODE=benchmark; shift;;
+        --manual) MODE=manual; shift;;
+        --uci) MODE=uci; shift;;
+        --apply) MODE=apply; shift;;
+        -h|--help) usage; exit 0;;
+        *) die "неизвестный параметр: $1";;
+    esac
+done
+
+need jq
+need base64
+echo "$SECTION" | grep -Eq '^[A-Za-z0-9_]+$' || die 'section допускает только A-Z, a-z, 0-9 и _'
+
+if [ -n "$SUB_URL" ]; then
+    need curl
+    curl -fsSL --max-time 60 -A 'Happ/1.0' "$SUB_URL" -o "$RAW" || die 'не удалось скачать подписку'
+elif [ -n "$SUB_FILE" ] && [ -s "$SUB_FILE" ]; then
+    cp "$SUB_FILE" "$RAW" || die 'не удалось прочитать подписку'
+else
+    die 'укажите -f FILE или -u URL'
+fi
+
+if grep -q 'vless://' "$RAW" 2>/dev/null || head -c 1 "$RAW" | grep -q '[{[]'; then
+    cp "$RAW" "$TEXT"
+else
+    base64 -d "$RAW" > "$TEXT" 2>/dev/null || cp "$RAW" "$TEXT"
+fi
+
+url_decode() { printf '%b' "$(printf '%s' "$1" | sed 's/+/ /g; s/%/\\x/g')" 2>/dev/null || printf '%s' "$1"; }
+query_value() {
+    printf '%s' "$1" | sed 's/^[^?]*?//; s/#.*$//' | tr '&' '\n' | awk -F= -v key="$2" '$1==key {print substr($0,length($1)+2); exit}'
+}
+parse_uri() {
+    uri=$1
+    body=${uri#vless://}; uuid=${body%@*}; rest=${body#*@}; hostport=${rest%%\?*}
+    host=${hostport%:*}; port=${hostport##*:}; [ "$host" = "$port" ] && port=443
+    label=$(url_decode "${uri#*#}"); [ "$label" = "$uri" ] && label="$host:$port"
+    flow=$(url_decode "$(query_value "$uri" flow)"); [ -n "$flow" ] || flow=xtls-rprx-vision
+    sni=$(url_decode "$(query_value "$uri" sni)"); [ -n "$sni" ] || sni=$(url_decode "$(query_value "$uri" serverName)"); [ -n "$sni" ] || sni=$host
+    fp=$(url_decode "$(query_value "$uri" fp)"); [ -n "$fp" ] || fp=firefox
+    pbk=$(url_decode "$(query_value "$uri" pbk)"); [ -n "$pbk" ] || pbk=$(url_decode "$(query_value "$uri" publicKey)")
+    sid=$(url_decode "$(query_value "$uri" sid)"); [ -n "$sid" ] || sid=$(url_decode "$(query_value "$uri" shortId)")
+    transport=$(url_decode "$(query_value "$uri" type)"); [ -n "$transport" ] || transport=tcp
+    [ -n "$uuid" ] && [ -n "$host" ] && [ -n "$pbk" ] && [ -n "$sid" ] && [ "$transport" = tcp ] || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$host" "$port" "$uuid" "$flow" "$sni" "$fp" "$pbk" "$sid"
+}
+
+: > "$NODES"
+if grep -q 'vless://' "$TEXT" 2>/dev/null; then
+    grep -o 'vless://[^[:space:]]*' "$TEXT" | while IFS= read -r uri; do parse_uri "$uri" >> "$NODES" || true; done
+else
+    jq -r '
+      (if type == "array" then .[] else . end) as $cfg
+      | ($cfg.outbounds // [])[]?
+      | select(.protocol == "vless")
+      | . as $ob | ($ob.settings.vnext[0] // {}) as $v | ($v.users[0] // {}) as $u
+      | ($ob.streamSettings // {}) as $s | ($s.realitySettings // {}) as $r
+      | select(($s.security // "reality") == "reality")
+      | [($ob.tag // $cfg.remarks // "node"), ($v.address // ""), (($v.port // 443)|tostring),
+         ($u.id // ""), ($u.flow // "xtls-rprx-vision"), ($r.serverName // $v.address // ""),
+         ($r.fingerprint // "firefox"), ($r.publicKey // ""), ($r.shortId // "")] | @tsv
+    ' "$TEXT" > "$NODES" 2>/dev/null || die 'не удалось разобрать JSON-подписку'
+fi
+
+cp "$NODES" "$NODES.raw"
+: > "$NODES.ok"
+while IFS="$TAB" read -r label host port uuid flow sni fp pbk sid; do
+    [ -n "$host" ] && [ -n "$sni" ] || continue
+    echo "$port" | grep -Eq '^[0-9]+$' || continue
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || continue
+    echo "$uuid" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' || continue
+    [ "$flow" = xtls-rprx-vision ] || continue
+    echo "$pbk" | grep -Eq '^[A-Za-z0-9_-]{43}=?$' || continue
+    echo "$sid" | grep -Eq '^([0-9A-Fa-f]{2}){1,8}$' || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$host" "$port" "$uuid" "$flow" "$sni" "$fp" "$pbk" "$sid" >> "$NODES.ok"
+done < "$NODES.raw"
+mv "$NODES.ok" "$NODES"
+rm -f "$NODES.raw"
+COUNT=$(wc -l < "$NODES" | tr -d ' ')
+[ "$COUNT" -gt 0 ] || die 'валидные VLESS Reality-ноды не найдены'
+
+show_list() { awk -F '\t' '{printf "%3d %-30s %s:%s sni=%s\n", NR, substr($1,1,30), $2, $3, $6}' "$NODES"; }
+get_node() { awk -F '\t' -v n="$1" 'NR==n {print; exit}' "$NODES"; }
+require_node() {
+    [ -n "$NODE_INDEX" ] || die 'для этого режима требуется --node N'
+    NODE_LINE=$(get_node "$NODE_INDEX"); [ -n "$NODE_LINE" ] || die "нода $NODE_INDEX не найдена"
+}
+read_node() { IFS="$TAB" read -r N_NAME N_HOST N_PORT N_UUID N_FLOW N_SNI N_FP N_PBK N_SID <<EOF
+$1
+EOF
+}
+
+print_manual_line() {
+    read_node "$1"
+    cat <<EOF
+Address: $N_HOST
+Port: $N_PORT
+UUID: $N_UUID
+SNI: $N_SNI
+uTLS fingerprint: $N_FP
+Reality public key: $N_PBK
+Reality short ID: $N_SID
+EOF
+}
+manual() {
+    cat <<EOF
+ОБЩИЕ ПОЛЯ HOMEPROXY
+Type: VLESS
+TLS: включён
+Reality: включён
+Network/Transport: TCP
+Flow: xtls-rprx-vision
+Packet encoding: xudp
+Allow insecure: выключено
+EOF
+    if [ -n "$NODE_INDEX" ]; then require_node; print_manual_line "$NODE_LINE"; else
+        index=0
+        while IFS= read -r line; do index=$((index + 1)); log ''; log "НОДА $index"; print_manual_line "$line"; done < "$NODES"
+    fi
+    log ''; log 'Не переносить: burstObservatory, SOCKS/HTTP-порты, пути логов, level, mux, DNS Happ, leastLoad.'
+}
+
+print_uci() {
+    read_node "$1"
+    print_set() { escaped=$(printf '%s' "$2" | sed "s/'/'\\\\''/g"); printf "uci set %s='%s'\n" "$1" "$escaped"; }
+    print_set "homeproxy.$SECTION" node
+    print_set "homeproxy.$SECTION.label" "$N_NAME"
+    print_set "homeproxy.$SECTION.type" vless
+    print_set "homeproxy.$SECTION.address" "$N_HOST"
+    print_set "homeproxy.$SECTION.port" "$N_PORT"
+    print_set "homeproxy.$SECTION.uuid" "$N_UUID"
+    print_set "homeproxy.$SECTION.tls" 1
+    print_set "homeproxy.$SECTION.tls_sni" "$N_SNI"
+    print_set "homeproxy.$SECTION.tls_reality" 1
+    print_set "homeproxy.$SECTION.tls_reality_public_key" "$N_PBK"
+    print_set "homeproxy.$SECTION.tls_reality_short_id" "$N_SID"
+    print_set "homeproxy.$SECTION.tls_utls" "$N_FP"
+    print_set "homeproxy.$SECTION.vless_flow" "$N_FLOW"
+    print_set "homeproxy.$SECTION.packet_encoding" xudp
+    print_set homeproxy.config.main_node "$SECTION"
+    print_set homeproxy.config.main_udp_node same
+    printf '%s\n' 'uci commit homeproxy' '/etc/init.d/homeproxy restart'
+}
+
+apply_node() {
+    [ "$(id -u)" = 0 ] || die '--apply требует root'
+    need uci
+    read_node "$1"
+    backup="/etc/config/homeproxy.bak-$(date +%Y%m%d-%H%M%S)"
+    cp /etc/config/homeproxy "$backup" || die 'не удалось создать backup HomeProxy'
+    uci set "homeproxy.$SECTION=node"
+    uci set "homeproxy.$SECTION.label=$N_NAME"
+    uci set "homeproxy.$SECTION.type=vless"
+    uci set "homeproxy.$SECTION.address=$N_HOST"
+    uci set "homeproxy.$SECTION.port=$N_PORT"
+    uci set "homeproxy.$SECTION.uuid=$N_UUID"
+    uci set "homeproxy.$SECTION.tls=1"
+    uci set "homeproxy.$SECTION.tls_sni=$N_SNI"
+    uci set "homeproxy.$SECTION.tls_reality=1"
+    uci set "homeproxy.$SECTION.tls_reality_public_key=$N_PBK"
+    uci set "homeproxy.$SECTION.tls_reality_short_id=$N_SID"
+    uci set "homeproxy.$SECTION.tls_utls=$N_FP"
+    uci set "homeproxy.$SECTION.vless_flow=$N_FLOW"
+    uci set "homeproxy.$SECTION.packet_encoding=xudp"
+    uci set "homeproxy.config.main_node=$SECTION"
+    uci set 'homeproxy.config.main_udp_node=same'
+    uci commit homeproxy
+    if /etc/init.d/homeproxy restart && sleep 2 && /etc/init.d/homeproxy status >/dev/null 2>&1; then
+        log "HomeProxy обновлён. Backup: $backup"
+    else
+        cp "$backup" /etc/config/homeproxy
+        /etc/init.d/homeproxy restart >/dev/null 2>&1 || true
+        die 'HomeProxy не запустился; предыдущая конфигурация восстановлена'
+    fi
+}
+
+make_config() {
+    read_node "$2"
+    jq -n --arg host "$N_HOST" --argjson port "$N_PORT" --arg uuid "$N_UUID" --arg flow "$N_FLOW" --arg sni "$N_SNI" --arg fp "$N_FP" --arg pbk "$N_PBK" --arg sid "$N_SID" --argjson local_port "$3" '
+      {log:{level:"error"},inbounds:[{type:"socks",tag:"socks-in",listen:"127.0.0.1",listen_port:$local_port}],
+       outbounds:[{type:"vless",tag:"proxy",server:$host,server_port:$port,uuid:$uuid,flow:$flow,network:"tcp",packet_encoding:"xudp",
+       tls:{enabled:true,insecure:false,server_name:$sni,utls:{enabled:true,fingerprint:$fp},reality:{enabled:true,public_key:$pbk,short_id:$sid}}},{type:"direct",tag:"direct"}],route:{final:"proxy"}}' > "$1"
+}
+
+benchmark() {
+    need sing-box; need curl
+    : > "$RESULTS"
+    index=0
+    while IFS= read -r line; do
+        index=$((index + 1)); [ "$MAX_NODES" -gt 0 ] && [ "$index" -gt "$MAX_NODES" ] && break
+        read_node "$line"; local_port=$((BASE_PORT + index)); cfg="$WORK_DIR.$index.json"; logfile="$WORK_DIR.$index.log"
+        log "[$index/$COUNT] $N_NAME $N_HOST:$N_PORT"
+        make_config "$cfg" "$line" "$local_port"
+        if ! sing-box check -c "$cfg" >"$logfile" 2>&1; then log '  CONFIG FAIL'; continue; fi
+        sing-box run -c "$cfg" >>"$logfile" 2>&1 & SB_PID=$!; sleep 1
+        output=$(curl --socks5-hostname "127.0.0.1:$local_port" -4 -LsS --connect-timeout 7 --max-time 25 -o /dev/null -w '%{http_code}\t%{time_total}\t%{speed_download}' "$TEST_URL" 2>/dev/null || true)
+        kill "$SB_PID" >/dev/null 2>&1 || true; wait "$SB_PID" 2>/dev/null || true; SB_PID=''
+        code=$(printf '%s' "$output" | awk -F '\t' '{print $1}'); total=$(printf '%s' "$output" | awk -F '\t' '{print $2}'); speed=$(printf '%s' "$output" | awk -F '\t' '{print $3}')
+        case "$code" in 200|204|301|302) log "  OK HTTP=$code total=${total}s speed=${speed}B/s"; printf '%s\t%s\t%s\n' "$total" "$index" "$line" >> "$RESULTS";; *) log "  FAIL HTTP=${code:-000}";; esac
+    done < "$NODES"
+    [ -s "$RESULTS" ] || die 'рабочие ноды не найдены'
+    log ''; log 'TOP:'; sort -n -k1,1 "$RESULTS" | head -15 | awk -F '\t' '{printf "%7sms node=%s %s %s:%s\n", $1*1000,$2,$3,$4,$5}'
+    BEST=$(sort -n -k1,1 "$RESULTS" | head -1 | cut -f2)
+    log ''; log "Лучшая нода: $BEST"
+    NODE_INDEX=$BEST; require_node; log ''; log 'Инструкция HomeProxy:'; print_manual_line "$NODE_LINE"
+}
+
+case "$MODE" in
+    list) show_list;;
+    manual) manual;;
+    uci) require_node; print_uci "$NODE_LINE";;
+    apply) require_node; apply_node "$NODE_LINE";;
+    benchmark) benchmark;;
+esac
