@@ -14,7 +14,11 @@ help:
 		'Основные команды:' \
 		'  ./scripts/vpn --help' \
 		'  ./scripts/openwrt-vless --help' \
-		'  ./scripts/openwrt-dns --help'
+		'  ./scripts/openwrt-dns --help' \
+		'' \
+		'Установка CLI на OpenWrt:' \
+		'  scp scripts/openwrt-vless root@openwrt:/usr/bin/vpn' \
+		'  ssh root@openwrt chmod +x /usr/bin/vpn'
 
 test:
 	python3 -m unittest discover -s tests -v

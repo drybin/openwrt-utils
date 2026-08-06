@@ -44,6 +44,12 @@ opkg install curl jq
 
 Также необходим sing-box, обычно установленный вместе с HomeProxy. OpenWrt-скрипты не требуют Python.
 
+Команда `base64` не обязательна для JSON и обычных списков `vless://`. Если провайдер отдаёт Base64-подписку, скрипт попробует `base64`, BusyBox applet или `openssl`. При отсутствии всех декодеров установите:
+
+```sh
+opkg install coreutils-base64
+```
+
 ## Подписка и секреты
 
 URL лучше передавать через переменную окружения:
@@ -171,6 +177,55 @@ sudo ./scripts/vpn apply-sing-box \
 Скопируйте `scripts/openwrt-vless` на роутер, затем:
 
 ```sh
+scp scripts/openwrt-vless root@openwrt:/usr/bin/vpn
+ssh root@openwrt chmod +x /usr/bin/vpn
+```
+
+На роутере используется тот же интерфейс команд, но без Python:
+
+```sh
+export VPN_SUBSCRIPTION_URL='https://provider.example/subscription/token'
+
+vpn download --output /root/subscription.sub
+vpn nodes --subscription-file /root/subscription.sub
+vpn benchmark --subscription-file /root/subscription.sub --max 10
+vpn homeproxy-manual --subscription-file /root/subscription.sub --node 2
+vpn homeproxy-uci --subscription-file /root/subscription.sub --node 2
+```
+
+Проверить все ноды и сразу применить лучшую из того же результата:
+
+```sh
+vpn benchmark --subscription-file /root/subscription.sub --max 10 --apply-best
+```
+
+После `vpn download --output /root/subscription.sub` параметр `--subscription-file` можно не указывать:
+
+```sh
+vpn nodes
+vpn benchmark --max 10
+```
+
+По умолчанию OpenWrt-версия ищет `/root/subscription.sub`, затем старый `/root/connliberty.sub`. Путь можно переопределить переменной `VPN_SUBSCRIPTION_FILE`.
+
+Применение HomeProxy-ноды:
+
+```sh
+vpn homeproxy-apply \
+  --subscription-file /root/subscription.sub \
+  --node 2 \
+  --section vless_auto
+```
+
+Если HomeProxy использует `routing_mode=custom`, скрипт обновляет существующий `routing_node`, а не неиспользуемый `main_node`. При нескольких routing nodes укажите нужный явно:
+
+```sh
+vpn homeproxy-apply --node 2 --section vless_auto --routing-node AutoVPN
+```
+
+Старый интерфейс скрипта также сохранён:
+
+```sh
 chmod +x /root/openwrt-vless
 
 /root/openwrt-vless -f /root/subscription.sub --list
@@ -179,7 +234,7 @@ chmod +x /root/openwrt-vless
 /root/openwrt-vless -f /root/subscription.sub --uci --node 2
 ```
 
-Применение выполняется только явно:
+Применение через старый интерфейс выполняется только явно:
 
 ```sh
 /root/openwrt-vless -f /root/subscription.sub \
@@ -192,7 +247,9 @@ chmod +x /root/openwrt-vless
 - обновляет только `config node` и `homeproxy.config.main_node`;
 - не заменяет маршрутизацию, DNS, subscription и control-секции;
 - перезапускает HomeProxy;
-- восстанавливает backup, если сервис не запустился.
+- сверяет записанные UCI-поля до и после перезапуска;
+- проверяет выбранную ноду в `/var/run/homeproxy/sing-box-c.json`;
+- восстанавливает backup, если сервис не запустился или параметры изменились.
 
 ## DNS на OpenWrt
 

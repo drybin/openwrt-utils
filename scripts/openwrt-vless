@@ -2,14 +2,17 @@
 # VLESS Reality benchmark and HomeProxy helper for OpenWrt/BusyBox.
 set -u
 
-SUB_FILE=''
-SUB_URL=''
+SUB_FILE=${VPN_SUBSCRIPTION_FILE:-}
+SUB_URL=${VPN_SUBSCRIPTION_URL:-}
 TEST_URL='https://detectportal.firefox.com/success.txt'
 MAX_NODES=0
 BASE_PORT=18080
 MODE=benchmark
 NODE_INDEX=''
 SECTION=vless_auto
+ROUTING_NODE=''
+SUB_OUTPUT=subscription.sub
+APPLY_BEST=0
 WORK_DIR="/tmp/openwrt-vless.$$"
 RAW="$WORK_DIR.raw"
 TEXT="$WORK_DIR.txt"
@@ -17,6 +20,16 @@ NODES="$WORK_DIR.nodes"
 RESULTS="$WORK_DIR.results"
 TAB=$(printf '\t')
 SB_PID=''
+
+if [ -z "$SUB_FILE" ]; then
+    if [ -s /root/subscription.sub ]; then
+        SUB_FILE=/root/subscription.sub
+    elif [ -s /root/connliberty.sub ]; then
+        SUB_FILE=/root/connliberty.sub
+    else
+        SUB_FILE=/root/subscription.sub
+    fi
+fi
 
 log() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
@@ -31,37 +44,56 @@ trap cleanup EXIT INT TERM
 usage() {
     cat <<EOF
 Использование:
-  $0 -f subscription.sub [--benchmark] [--max N]
-  $0 -u URL --manual [--node N]
-  $0 -f subscription.sub --uci --node N [--section NAME]
-  $0 -f subscription.sub --apply --node N [--section NAME]
+  vpn download --subscription-url URL --output subscription.sub
+  vpn nodes --subscription-file subscription.sub
+  vpn benchmark --subscription-file subscription.sub [--max N] [--apply-best]
+  vpn homeproxy-manual --subscription-file subscription.sub [--node N]
+  vpn homeproxy-uci --subscription-file subscription.sub --node N
+  vpn homeproxy-apply --subscription-file subscription.sub --node N [--routing-node NAME]
 
-Режимы: --list, --benchmark, --manual, --uci, --apply.
+Также поддерживаются старые флаги: --list, --benchmark, --manual, --uci, --apply.
+По умолчанию читается /root/subscription.sub, затем /root/connliberty.sub.
+Источник можно переопределить через VPN_SUBSCRIPTION_FILE или VPN_SUBSCRIPTION_URL.
 Для --apply создаётся backup /etc/config/homeproxy.bak-DATE.
 EOF
 }
 
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        download) MODE=download; shift;;
+        nodes) MODE=list; shift;;
+        benchmark) MODE=benchmark; shift;;
+        homeproxy-manual) MODE=manual; shift;;
+        homeproxy-uci) MODE=uci; shift;;
+        homeproxy-apply) MODE=apply; shift;;
+        help) usage; exit 0;;
+    esac
+fi
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        -f|--file) SUB_FILE=$2; shift 2;;
-        -u|--url) SUB_URL=$2; shift 2;;
+        -f|--file|--subscription-file) SUB_FILE=$2; shift 2;;
+        -u|--url|--subscription-url) SUB_URL=$2; shift 2;;
+        -o|--output) SUB_OUTPUT=$2; shift 2;;
         --test-url) TEST_URL=$2; shift 2;;
         --max) MAX_NODES=$2; shift 2;;
         --node) NODE_INDEX=$2; shift 2;;
         --section) SECTION=$2; shift 2;;
+        --routing-node) ROUTING_NODE=$2; shift 2;;
         --list) MODE=list; shift;;
         --benchmark) MODE=benchmark; shift;;
         --manual) MODE=manual; shift;;
         --uci) MODE=uci; shift;;
         --apply) MODE=apply; shift;;
+        --apply-best) APPLY_BEST=1; shift;;
         -h|--help) usage; exit 0;;
         *) die "неизвестный параметр: $1";;
     esac
 done
 
 need jq
-need base64
 echo "$SECTION" | grep -Eq '^[A-Za-z0-9_]+$' || die 'section допускает только A-Z, a-z, 0-9 и _'
+[ -z "$ROUTING_NODE" ] || echo "$ROUTING_NODE" | grep -Eq '^[A-Za-z0-9_]+$' || die 'routing-node допускает только A-Z, a-z, 0-9 и _'
 
 if [ -n "$SUB_URL" ]; then
     need curl
@@ -72,10 +104,24 @@ else
     die 'укажите -f FILE или -u URL'
 fi
 
+decode_base64_subscription() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -d "$RAW" > "$TEXT" 2>/dev/null && return 0
+        base64 -D "$RAW" > "$TEXT" 2>/dev/null && return 0
+    fi
+    if command -v busybox >/dev/null 2>&1; then
+        busybox base64 -d "$RAW" > "$TEXT" 2>/dev/null && return 0
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        openssl base64 -d -A -in "$RAW" -out "$TEXT" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
 if grep -q 'vless://' "$RAW" 2>/dev/null || head -c 1 "$RAW" | grep -q '[{[]'; then
     cp "$RAW" "$TEXT"
 else
-    base64 -d "$RAW" > "$TEXT" 2>/dev/null || cp "$RAW" "$TEXT"
+    decode_base64_subscription || die 'подписка похожа на Base64, но декодер недоступен; установите coreutils-base64'
 fi
 
 url_decode() { printf '%b' "$(printf '%s' "$1" | sed 's/+/ /g; s/%/\\x/g')" 2>/dev/null || printf '%s' "$1"; }
@@ -131,6 +177,22 @@ rm -f "$NODES.raw"
 COUNT=$(wc -l < "$NODES" | tr -d ' ')
 [ "$COUNT" -gt 0 ] || die 'валидные VLESS Reality-ноды не найдены'
 
+download_subscription() {
+    target=$SUB_OUTPUT
+    target_dir=${target%/*}
+    [ "$target_dir" = "$target" ] && target_dir=.
+    [ -d "$target_dir" ] || die "каталог не существует: $target_dir"
+    if [ -e "$target" ]; then
+        backup="$target.bak-$(date +%Y%m%d-%H%M%S)"
+        cp "$target" "$backup" || die 'не удалось создать backup подписки'
+        log "Backup: $backup"
+    fi
+    cp "$RAW" "$target" || die 'не удалось сохранить подписку'
+    chmod 600 "$target" || true
+    log "Сохранено: $target"
+    log "Валидных VLESS Reality-нод: $COUNT"
+}
+
 show_list() { awk -F '\t' '{printf "%3d %-30s %s:%s sni=%s\n", NR, substr($1,1,30), $2, $3, $6}' "$NODES"; }
 get_node() { awk -F '\t' -v n="$1" 'NR==n {print; exit}' "$NODES"; }
 require_node() {
@@ -173,7 +235,9 @@ EOF
 }
 
 print_uci() {
+    need uci
     read_node "$1"
+    resolve_homeproxy_routing
     print_set() { escaped=$(printf '%s' "$2" | sed "s/'/'\\\\''/g"); printf "uci set %s='%s'\n" "$1" "$escaped"; }
     print_set "homeproxy.$SECTION" node
     print_set "homeproxy.$SECTION.label" "$N_NAME"
@@ -189,16 +253,51 @@ print_uci() {
     print_set "homeproxy.$SECTION.tls_utls" "$N_FP"
     print_set "homeproxy.$SECTION.vless_flow" "$N_FLOW"
     print_set "homeproxy.$SECTION.packet_encoding" xudp
-    print_set homeproxy.config.main_node "$SECTION"
-    print_set homeproxy.config.main_udp_node same
+    if [ "$ROUTING_MODE" = custom ]; then
+        print_set "homeproxy.$ROUTING_NODE.node" "$SECTION"
+    else
+        print_set homeproxy.config.main_node "$SECTION"
+        print_set homeproxy.config.main_udp_node same
+    fi
     printf '%s\n' 'uci commit homeproxy' '/etc/init.d/homeproxy restart'
+}
+
+resolve_homeproxy_routing() {
+    ROUTING_MODE=$(uci -q get homeproxy.config.routing_mode 2>/dev/null || true)
+    [ -n "$ROUTING_MODE" ] || ROUTING_MODE=bypass_mainland_china
+    [ "$ROUTING_MODE" = custom ] || return 0
+    if [ -n "$ROUTING_NODE" ]; then
+        [ "$(uci -q get "homeproxy.$ROUTING_NODE" 2>/dev/null || true)" = routing_node ] || die "routing node не найден: $ROUTING_NODE"
+        return 0
+    fi
+    candidates=$(uci -q show homeproxy 2>/dev/null | sed -n 's/^homeproxy\.\([^=]*\)=routing_node$/\1/p')
+    enabled=''
+    for candidate in $candidates; do
+        [ "$(uci -q get "homeproxy.$candidate.enabled" 2>/dev/null || true)" = 1 ] && enabled="$enabled $candidate"
+    done
+    set -- $enabled
+    if [ "$#" = 1 ]; then
+        ROUTING_NODE=$1
+        return 0
+    fi
+    set -- $candidates
+    if [ "$#" = 1 ]; then
+        ROUTING_NODE=$1
+        return 0
+    fi
+    err "HomeProxy использует custom routing; найдено routing nodes: ${candidates:-нет}"
+    die 'укажите нужный через --routing-node NAME'
 }
 
 apply_node() {
     [ "$(id -u)" = 0 ] || die '--apply требует root'
     need uci
     read_node "$1"
+    resolve_homeproxy_routing
+    log "Применяется нода $NODE_INDEX: $N_HOST:$N_PORT, short ID=$N_SID"
+    log "Режим HomeProxy: $ROUTING_MODE${ROUTING_NODE:+, routing node=$ROUTING_NODE}"
     backup="/etc/config/homeproxy.bak-$(date +%Y%m%d-%H%M%S)"
+    restart_log="$WORK_DIR.restart.log"
     cp /etc/config/homeproxy "$backup" || die 'не удалось создать backup HomeProxy'
     uci set "homeproxy.$SECTION=node"
     uci set "homeproxy.$SECTION.label=$N_NAME"
@@ -214,16 +313,68 @@ apply_node() {
     uci set "homeproxy.$SECTION.tls_utls=$N_FP"
     uci set "homeproxy.$SECTION.vless_flow=$N_FLOW"
     uci set "homeproxy.$SECTION.packet_encoding=xudp"
-    uci set "homeproxy.config.main_node=$SECTION"
-    uci set 'homeproxy.config.main_udp_node=same'
-    uci commit homeproxy
-    if /etc/init.d/homeproxy restart && sleep 2 && /etc/init.d/homeproxy status >/dev/null 2>&1; then
-        log "HomeProxy обновлён. Backup: $backup"
+    if [ "$ROUTING_MODE" = custom ]; then
+        uci set "homeproxy.$ROUTING_NODE.node=$SECTION"
     else
+        uci set "homeproxy.config.main_node=$SECTION"
+        uci set 'homeproxy.config.main_udp_node=same'
+    fi
+    uci commit homeproxy
+
+    verify_uci() {
+        verify_option "homeproxy.$SECTION.address" "$N_HOST" || return 1
+        verify_option "homeproxy.$SECTION.port" "$N_PORT" || return 1
+        verify_option "homeproxy.$SECTION.uuid" "$N_UUID" || return 1
+        verify_option "homeproxy.$SECTION.tls_sni" "$N_SNI" || return 1
+        verify_option "homeproxy.$SECTION.tls_reality_public_key" "$N_PBK" || return 1
+        verify_option "homeproxy.$SECTION.tls_reality_short_id" "$N_SID" || return 1
+        if [ "$ROUTING_MODE" = custom ]; then
+            verify_option "homeproxy.$ROUTING_NODE.node" "$SECTION" || return 1
+        else
+            verify_option "homeproxy.config.main_node" "$SECTION" || return 1
+        fi
+    }
+    verify_option() {
+        option=$1 expected=$2
+        actual=$(uci -q get "$option" 2>/dev/null || true)
+        if [ "$actual" != "$expected" ]; then
+            err "$option: ожидалось '$expected', записано '$actual'"
+            return 1
+        fi
+    }
+    rollback_homeproxy() {
         cp "$backup" /etc/config/homeproxy
         /etc/init.d/homeproxy restart >/dev/null 2>&1 || true
-        die 'HomeProxy не запустился; предыдущая конфигурация восстановлена'
+        die "$1; предыдущая конфигурация восстановлена из $backup"
+    }
+
+    verify_uci || rollback_homeproxy 'UCI-параметры изменились сразу после commit'
+    if ! /etc/init.d/homeproxy restart >"$restart_log" 2>&1; then
+        sed -n '1,20p' "$restart_log" >&2
+        rollback_homeproxy 'HomeProxy restart завершился ошибкой'
     fi
+    sleep 3
+    verify_uci || rollback_homeproxy 'UCI-параметры изменились после restart'
+    if ! /etc/init.d/homeproxy status >/dev/null 2>&1; then
+        rollback_homeproxy 'HomeProxy не перешёл в состояние running'
+    fi
+    runtime_config=/var/run/homeproxy/sing-box-c.json
+    if [ ! -s "$runtime_config" ]; then
+        rollback_homeproxy 'HomeProxy не создал runtime-конфигурацию sing-box'
+    fi
+    if [ "$ROUTING_MODE" = custom ]; then runtime_tag="cfg-$SECTION-out"; else runtime_tag=main-out; fi
+    if ! jq -e --arg tag "$runtime_tag" --arg host "$N_HOST" --argjson port "$N_PORT" --arg uuid "$N_UUID" --arg pbk "$N_PBK" --arg sid "$N_SID" '
+        any(.outbounds[]?;
+            .tag == $tag and .type == "vless" and .server == $host and .server_port == $port
+            and .uuid == $uuid and .tls.reality.public_key == $pbk and .tls.reality.short_id == $sid)
+    ' "$runtime_config" >/dev/null 2>&1; then
+        rollback_homeproxy 'runtime-конфигурация sing-box не содержит выбранную ноду или short ID'
+    fi
+    if [ -s "$restart_log" ]; then
+        log 'Вывод HomeProxy restart:'
+        sed -n '1,10p' "$restart_log"
+    fi
+    log "HomeProxy обновлён и проверен. Backup: $backup"
 }
 
 make_config() {
@@ -255,9 +406,13 @@ benchmark() {
     BEST=$(sort -n -k1,1 "$RESULTS" | head -1 | cut -f2)
     log ''; log "Лучшая нода: $BEST"
     NODE_INDEX=$BEST; require_node; log ''; log 'Инструкция HomeProxy:'; print_manual_line "$NODE_LINE"
+    if [ "$APPLY_BEST" = 1 ]; then
+        log ''; apply_node "$NODE_LINE"
+    fi
 }
 
 case "$MODE" in
+    download) download_subscription;;
     list) show_list;;
     manual) manual;;
     uci) require_node; print_uci "$NODE_LINE";;

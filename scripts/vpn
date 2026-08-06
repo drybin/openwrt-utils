@@ -1,4 +1,16 @@
 #!/bin/sh
 BASE_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-exec python3 "$BASE_DIR/vpn_tool.py" "$@"
 
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 "$BASE_DIR/vpn_tool.py" "$@"
+fi
+
+OPENWRT_VPN="$BASE_DIR/scripts/openwrt-vless"
+if [ -x "$OPENWRT_VPN" ]; then
+    exec "$OPENWRT_VPN" "$@"
+fi
+
+printf '%s\n' \
+    'ERROR: python3 не найден и OpenWrt-версия scripts/openwrt-vless недоступна.' \
+    'На OpenWrt установите scripts/openwrt-vless как /usr/bin/vpn.' >&2
+exit 1
