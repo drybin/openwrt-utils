@@ -15,6 +15,7 @@ SUB_OUTPUT=subscription.sub
 APPLY_BEST=0
 ENV_FILE=${VPN_ENV_FILE:-}
 AUTO_TEST_URL='https://www.youtube.com/'
+YOUTUBE_RESULT='ещё не проверено'
 AUTO_BACKUP=''
 AUTO_SUCCESS=0
 AUTO_LOCK=0
@@ -65,8 +66,20 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 youtube_available() {
-    code=$(curl -sS -L --max-redirs 3 --connect-timeout 5 --max-time 15 \
-        -o /dev/null -w '%{http_code}' "$AUTO_TEST_URL" 2>/dev/null) || return 1
+    proxy_port=$(jq -r '.inbounds[]? | select(.type == "mixed") | .listen_port' \
+        "$HOMEPROXY_RUNTIME_CONFIG" 2>/dev/null | head -n 1)
+    case "$proxy_port" in
+        ''|*[!0-9]*) YOUTUBE_RESULT='mixed-in HomeProxy не найден'; return 2;;
+    esac
+    if code=$(curl -sS -L --proxy "http://127.0.0.1:$proxy_port" --noproxy '' \
+        --max-redirs 3 --connect-timeout 5 --max-time 15 \
+        -o /dev/null -w '%{http_code}' "$AUTO_TEST_URL" 2>/dev/null); then
+        YOUTUBE_RESULT="HTTP=${code:-000}"
+    else
+        curl_status=$?
+        YOUTUBE_RESULT="curl=$curl_status HTTP=${code:-000}"
+        return 1
+    fi
     case "$code" in 2??|3??) return 0;; *) return 1;; esac
 }
 
@@ -140,12 +153,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$MODE" = auto ]; then
-    need curl
+    need curl; need jq
     if youtube_available; then
-        log 'YouTube доступен; ничего не меняем.'
+        log "YouTube доступен ($YOUTUBE_RESULT); ничего не меняем."
         exit 0
+    else
+        probe_status=$?
+        [ "$probe_status" -eq 1 ] || die "не удалось проверить YouTube через HomeProxy: $YOUTUBE_RESULT"
     fi
-    log 'YouTube недоступен; ищем рабочую ноду.'
+    log "YouTube недоступен ($YOUTUBE_RESULT); ищем рабочую ноду."
     mkdir "$AUTO_LOCK_DIR" 2>/dev/null || die 'другой запуск vpn auto уже выполняется'
     AUTO_LOCK=1
     [ "$(id -u)" = 0 ] || die 'auto требует root'
@@ -158,7 +174,9 @@ if [ "$MODE" = auto ]; then
     cp -p "$HOMEPROXY_CONFIG" "$auto_backup_candidate" || die 'не удалось сохранить исходную конфигурацию HomeProxy'
     AUTO_BACKUP=$auto_backup_candidate
     log "Backup HomeProxy: $AUTO_BACKUP"
+    log 'Останавливаем HomeProxy...'
     "$HOMEPROXY_SERVICE" stop || die 'не удалось остановить HomeProxy'
+    log 'HomeProxy остановлен.'
 fi
 
 need jq
@@ -167,6 +185,7 @@ echo "$SECTION" | grep -Eq '^[A-Za-z0-9_]+$' || die 'section допускает 
 
 if [ -n "$SUB_URL" ]; then
     need curl
+    [ "$MODE" != auto ] || log 'Скачиваем подписку (ожидание до 60 с)...'
     curl -fsSL --max-time 60 -A 'Happ/1.0' "$SUB_URL" -o "$RAW" || die 'не удалось скачать подписку'
 elif [ -n "$SUB_FILE" ] && [ -s "$SUB_FILE" ]; then
     cp "$SUB_FILE" "$RAW" || die 'не удалось прочитать подписку'
@@ -506,10 +525,13 @@ auto() {
         attempted=$((attempted + 1))
         if youtube_available; then
             AUTO_SUCCESS=1
-            log "YouTube доступен; оставлена нода $index."
+            log "YouTube доступен ($YOUTUBE_RESULT); оставлена нода $index."
             return 0
+        else
+            probe_status=$?
+            [ "$probe_status" -eq 1 ] || die "не удалось проверить YouTube через HomeProxy: $YOUTUBE_RESULT"
         fi
-        log "YouTube недоступен через ноду $index."
+        log "YouTube недоступен через ноду $index ($YOUTUBE_RESULT)."
     done < "$CANDIDATES"
     die "проверены $attempted нод, YouTube недоступен"
 }

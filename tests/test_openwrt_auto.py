@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import tempfile
 import textwrap
@@ -35,6 +36,7 @@ class OpenWrtAutoTests(unittest.TestCase):
             "homeproxy.vless_auto.address=old.example.test\n"
         )
         self.original_config = self.config.read_text()
+        self.runtime.write_text(json.dumps({"inbounds": [{"type": "mixed", "listen_port": 5330}]}))
         self.write_executable("id", "#!/bin/sh\necho 0\n")
         self.write_executable("sleep", "#!/bin/sh\nexit 0\n")
         self.write_executable("sing-box", "#!/bin/sh\ncase \"$1\" in check) exit 0;; run) exec /bin/sleep 30;; esac\n")
@@ -76,6 +78,8 @@ class OpenWrtAutoTests(unittest.TestCase):
                 print('000\\t0\\t0' if index == 1 else
                       f'200\\t{index / 100:.2f}\\t1000', end='')
                 sys.exit(0)
+            if '--proxy' not in args or args[args.index('--proxy') + 1] != 'http://127.0.0.1:5330':
+                sys.exit(2)
             config = Path(os.environ['VPN_HOMEPROXY_CONFIG']).read_text()
             good = os.environ.get('VPN_TEST_GOOD_HOST', 'good.example.test')
             print('200' if 'homeproxy.vless_auto.address=' + good in config else '000', end='')
@@ -104,7 +108,8 @@ class OpenWrtAutoTests(unittest.TestCase):
                     }},
                 }
                 Path(os.environ['VPN_HOMEPROXY_RUNTIME_CONFIG']).write_text(
-                    json.dumps({'outbounds': [outbound]}))
+                    json.dumps({'inbounds': [{'type': 'mixed', 'listen_port': 5330}],
+                                'outbounds': [outbound]}))
         """))
         self.service.chmod(0o755)
 
@@ -140,6 +145,14 @@ class OpenWrtAutoTests(unittest.TestCase):
         self.assertFalse(self.service_log.exists())
         self.assertFalse(self.output.exists())
 
+    def test_missing_mixed_inbound_makes_no_changes(self):
+        self.runtime.write_text(json.dumps({"inbounds": []}))
+        result = self.run_auto()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mixed-in HomeProxy не найден", result.stderr)
+        self.assertEqual(self.config.read_text(), self.original_config)
+        self.assertFalse(self.service_log.exists())
+
     def test_tries_next_node_and_keeps_first_working_one(self):
         result = self.run_auto()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -150,7 +163,7 @@ class OpenWrtAutoTests(unittest.TestCase):
         self.assertIn("Пробуем ноду 2/3", result.stdout)
         self.assertIn("Пробуем ноду 3/3", result.stdout)
         self.assertNotIn("Пробуем ноду 1/3", result.stdout)
-        self.assertIn("YouTube доступен; оставлена нода 3", result.stdout)
+        self.assertIn("YouTube доступен (HTTP=200); оставлена нода 3", result.stdout)
         self.assertIn("homeproxy.vless_auto.address=good.example.test", self.config.read_text())
         self.assertEqual(self.output.read_bytes(), self.subscription.read_bytes())
         self.assertEqual(self.service_log.read_text().splitlines(), ["stop", "restart", "status", "restart", "status"])
