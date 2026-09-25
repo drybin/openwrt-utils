@@ -13,11 +13,22 @@ SECTION=vless_auto
 ROUTING_NODE=''
 SUB_OUTPUT=subscription.sub
 APPLY_BEST=0
+ENV_FILE=${VPN_ENV_FILE:-}
+AUTO_TEST_URL='https://www.youtube.com/'
+AUTO_BACKUP=''
+AUTO_SUCCESS=0
+AUTO_LOCK=0
+AUTO_LOCK_DIR=${VPN_AUTO_LOCK_DIR:-/tmp/vpn-auto.lock}
+SUB_TEMP=''
+HOMEPROXY_CONFIG=${VPN_HOMEPROXY_CONFIG:-/etc/config/homeproxy}
+HOMEPROXY_SERVICE=${VPN_HOMEPROXY_SERVICE:-/etc/init.d/homeproxy}
+HOMEPROXY_RUNTIME_CONFIG=${VPN_HOMEPROXY_RUNTIME_CONFIG:-/var/run/homeproxy/sing-box-c.json}
 WORK_DIR="/tmp/openwrt-vless.$$"
 RAW="$WORK_DIR.raw"
 TEXT="$WORK_DIR.txt"
 NODES="$WORK_DIR.nodes"
 RESULTS="$WORK_DIR.results"
+CANDIDATES="$WORK_DIR.candidates"
 TAB=$(printf '\t')
 SB_PID=''
 
@@ -37,9 +48,41 @@ die() { err "$*"; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "не найдена команда $1"; }
 cleanup() {
     [ -n "$SB_PID" ] && kill "$SB_PID" >/dev/null 2>&1 || true
-    rm -f "$RAW" "$TEXT" "$NODES" "$NODES.raw" "$NODES.ok" "$RESULTS" "$WORK_DIR".*.json "$WORK_DIR".*.log
+    rm -f "$RAW" "$TEXT" "$NODES" "$NODES.raw" "$NODES.ok" "$RESULTS" "$CANDIDATES" "$WORK_DIR".*.json "$WORK_DIR".*.log
+    [ -z "$SUB_TEMP" ] || rm -f "$SUB_TEMP"
+    if [ -n "$AUTO_BACKUP" ] && [ "$AUTO_SUCCESS" != 1 ]; then
+        if cp -p "$AUTO_BACKUP" "$HOMEPROXY_CONFIG"; then
+            "$HOMEPROXY_SERVICE" restart >/dev/null 2>&1 || err 'не удалось перезапустить HomeProxy после восстановления'
+            err "auto не завершился успешно; конфигурация восстановлена из $AUTO_BACKUP"
+        else
+            err "не удалось восстановить HomeProxy из $AUTO_BACKUP"
+        fi
+    fi
+    [ "$AUTO_LOCK" != 1 ] || rmdir "$AUTO_LOCK_DIR" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+youtube_available() {
+    code=$(curl -sS -L --max-redirs 3 --connect-timeout 5 --max-time 15 \
+        -o /dev/null -w '%{http_code}' "$AUTO_TEST_URL" 2>/dev/null) || return 1
+    case "$code" in 2??|3??) return 0;; *) return 1;; esac
+}
+
+load_auto_env() {
+    [ -n "$SUB_URL" ] && return 0
+    if [ -z "$ENV_FILE" ]; then
+        if [ -f .env ]; then ENV_FILE=.env; else ENV_FILE=/root/.env; fi
+    fi
+    [ -f "$ENV_FILE" ] || die "не найден .env: $ENV_FILE"
+    SUB_URL=$(sed -n 's/^[[:space:]]*VPN_SUBSCRIPTION_URL[[:space:]]*=[[:space:]]*//p' "$ENV_FILE" | tail -n 1 | tr -d '\r')
+    case "$SUB_URL" in
+        \"*\") SUB_URL=${SUB_URL#\"}; SUB_URL=${SUB_URL%\"};;
+        \'*\') SUB_URL=${SUB_URL#\'}; SUB_URL=${SUB_URL%\'};;
+    esac
+    [ -n "$SUB_URL" ] || die "VPN_SUBSCRIPTION_URL не задан в $ENV_FILE"
+}
 
 usage() {
     cat <<EOF
@@ -50,11 +93,14 @@ usage() {
   vpn homeproxy-manual --subscription-file subscription.sub [--node N]
   vpn homeproxy-uci --subscription-file subscription.sub --node N
   vpn homeproxy-apply --subscription-file subscription.sub --node N [--routing-node NAME]
+  vpn auto [--max N] [--env-file /root/.env] [--output subscription.sub]
 
 Также поддерживаются старые флаги: --list, --benchmark, --manual, --uci, --apply.
 По умолчанию читается /root/subscription.sub, затем /root/connliberty.sub.
 Источник можно переопределить через VPN_SUBSCRIPTION_FILE или VPN_SUBSCRIPTION_URL.
 Для --apply создаётся backup /etc/config/homeproxy.bak-DATE.
+auto проверяет YouTube, затем тестирует все ноды и применяет только рабочие, начиная с самой быстрой.
+URL подписки читается из VPN_SUBSCRIPTION_URL в .env или /root/.env.
 EOF
 }
 
@@ -66,6 +112,7 @@ if [ "$#" -gt 0 ]; then
         homeproxy-manual) MODE=manual; shift;;
         homeproxy-uci) MODE=uci; shift;;
         homeproxy-apply) MODE=apply; shift;;
+        auto) MODE=auto; shift;;
         help) usage; exit 0;;
     esac
 fi
@@ -86,10 +133,33 @@ while [ "$#" -gt 0 ]; do
         --uci) MODE=uci; shift;;
         --apply) MODE=apply; shift;;
         --apply-best) APPLY_BEST=1; shift;;
+        --env-file) ENV_FILE=$2; shift 2;;
         -h|--help) usage; exit 0;;
         *) die "неизвестный параметр: $1";;
     esac
 done
+
+if [ "$MODE" = auto ]; then
+    need curl
+    if youtube_available; then
+        log 'YouTube доступен; ничего не меняем.'
+        exit 0
+    fi
+    log 'YouTube недоступен; ищем рабочую ноду.'
+    mkdir "$AUTO_LOCK_DIR" 2>/dev/null || die 'другой запуск vpn auto уже выполняется'
+    AUTO_LOCK=1
+    [ "$(id -u)" = 0 ] || die 'auto требует root'
+    need jq
+    [ -z "$NODE_INDEX" ] || die 'auto проверяет все ноды; --node здесь не используется'
+    case "$MAX_NODES" in ''|*[!0-9]*) die '--max должен быть неотрицательным числом';; esac
+    load_auto_env
+    [ -f "$HOMEPROXY_CONFIG" ] || die "не найден $HOMEPROXY_CONFIG"
+    auto_backup_candidate="$HOMEPROXY_CONFIG.bak-auto-$(date +%Y%m%d-%H%M%S)-$$"
+    cp -p "$HOMEPROXY_CONFIG" "$auto_backup_candidate" || die 'не удалось сохранить исходную конфигурацию HomeProxy'
+    AUTO_BACKUP=$auto_backup_candidate
+    log "Backup HomeProxy: $AUTO_BACKUP"
+    "$HOMEPROXY_SERVICE" stop || die 'не удалось остановить HomeProxy'
+fi
 
 need jq
 echo "$SECTION" | grep -Eq '^[A-Za-z0-9_]+$' || die 'section допускает только A-Z, a-z, 0-9 и _'
@@ -183,12 +253,15 @@ download_subscription() {
     [ "$target_dir" = "$target" ] && target_dir=.
     [ -d "$target_dir" ] || die "каталог не существует: $target_dir"
     if [ -e "$target" ]; then
-        backup="$target.bak-$(date +%Y%m%d-%H%M%S)"
+        backup="$target.bak-$(date +%Y%m%d-%H%M%S)-$$"
         cp "$target" "$backup" || die 'не удалось создать backup подписки'
         log "Backup: $backup"
     fi
-    cp "$RAW" "$target" || die 'не удалось сохранить подписку'
-    chmod 600 "$target" || true
+    SUB_TEMP="$target.tmp.$$"
+    cp "$RAW" "$SUB_TEMP" || die 'не удалось сохранить подписку'
+    chmod 600 "$SUB_TEMP" || die 'не удалось защитить файл подписки'
+    mv "$SUB_TEMP" "$target" || die 'не удалось заменить файл подписки'
+    SUB_TEMP=''
     log "Сохранено: $target"
     log "Валидных VLESS Reality-нод: $COUNT"
 }
@@ -296,9 +369,11 @@ apply_node() {
     resolve_homeproxy_routing
     log "Применяется нода $NODE_INDEX: $N_HOST:$N_PORT, short ID=$N_SID"
     log "Режим HomeProxy: $ROUTING_MODE${ROUTING_NODE:+, routing node=$ROUTING_NODE}"
-    backup="/etc/config/homeproxy.bak-$(date +%Y%m%d-%H%M%S)"
+    backup=${AUTO_BACKUP:-/etc/config/homeproxy.bak-$(date +%Y%m%d-%H%M%S)}
     restart_log="$WORK_DIR.restart.log"
-    cp /etc/config/homeproxy "$backup" || die 'не удалось создать backup HomeProxy'
+    if [ -z "$AUTO_BACKUP" ]; then
+        cp "$HOMEPROXY_CONFIG" "$backup" || die 'не удалось создать backup HomeProxy'
+    fi
     uci set "homeproxy.$SECTION=node"
     uci set "homeproxy.$SECTION.label=$N_NAME"
     uci set "homeproxy.$SECTION.type=vless"
@@ -343,22 +418,22 @@ apply_node() {
         fi
     }
     rollback_homeproxy() {
-        cp "$backup" /etc/config/homeproxy
-        /etc/init.d/homeproxy restart >/dev/null 2>&1 || true
+        cp "$backup" "$HOMEPROXY_CONFIG"
+        "$HOMEPROXY_SERVICE" restart >/dev/null 2>&1 || true
         die "$1; предыдущая конфигурация восстановлена из $backup"
     }
 
     verify_uci || rollback_homeproxy 'UCI-параметры изменились сразу после commit'
-    if ! /etc/init.d/homeproxy restart >"$restart_log" 2>&1; then
+    if ! "$HOMEPROXY_SERVICE" restart >"$restart_log" 2>&1; then
         sed -n '1,20p' "$restart_log" >&2
         rollback_homeproxy 'HomeProxy restart завершился ошибкой'
     fi
     sleep 3
     verify_uci || rollback_homeproxy 'UCI-параметры изменились после restart'
-    if ! /etc/init.d/homeproxy status >/dev/null 2>&1; then
+    if ! "$HOMEPROXY_SERVICE" status >/dev/null 2>&1; then
         rollback_homeproxy 'HomeProxy не перешёл в состояние running'
     fi
-    runtime_config=/var/run/homeproxy/sing-box-c.json
+    runtime_config=$HOMEPROXY_RUNTIME_CONFIG
     if [ ! -s "$runtime_config" ]; then
         rollback_homeproxy 'HomeProxy не создал runtime-конфигурацию sing-box'
     fi
@@ -402,6 +477,7 @@ benchmark() {
         case "$code" in 200|204|301|302) log "  OK HTTP=$code total=${total}s speed=${speed}B/s"; printf '%s\t%s\t%s\n' "$total" "$index" "$line" >> "$RESULTS";; *) log "  FAIL HTTP=${code:-000}";; esac
     done < "$NODES"
     [ -s "$RESULTS" ] || die 'рабочие ноды не найдены'
+    [ "$MODE" = auto ] && return 0
     log ''; log 'TOP:'; sort -n -k1,1 "$RESULTS" | head -15 | awk -F '\t' '{printf "%7sms node=%s %s %s:%s\n", $1*1000,$2,$3,$4,$5}'
     BEST=$(sort -n -k1,1 "$RESULTS" | head -1 | cut -f2)
     log ''; log "Лучшая нода: $BEST"
@@ -411,6 +487,33 @@ benchmark() {
     fi
 }
 
+auto() {
+    download_subscription
+    attempt_limit=$MAX_NODES
+    MAX_NODES=0
+    log "Проверяем все $COUNT нод через sing-box."
+    benchmark
+    sort -n -k1,1 "$RESULTS" | cut -f2 > "$CANDIDATES"
+    working_count=$(wc -l < "$CANDIDATES" | tr -d ' ')
+    log "Рабочих нод: $working_count. Пробуем их по скорости."
+    attempted=0
+    while IFS= read -r index; do
+        [ "$attempt_limit" -gt 0 ] && [ "$attempted" -ge "$attempt_limit" ] && break
+        NODE_INDEX=$index
+        NODE_LINE=$(get_node "$index")
+        log "Пробуем ноду $index/$COUNT"
+        apply_node "$NODE_LINE"
+        attempted=$((attempted + 1))
+        if youtube_available; then
+            AUTO_SUCCESS=1
+            log "YouTube доступен; оставлена нода $index."
+            return 0
+        fi
+        log "YouTube недоступен через ноду $index."
+    done < "$CANDIDATES"
+    die "проверены $attempted нод, YouTube недоступен"
+}
+
 case "$MODE" in
     download) download_subscription;;
     list) show_list;;
@@ -418,4 +521,5 @@ case "$MODE" in
     uci) require_node; print_uci "$NODE_LINE";;
     apply) require_node; apply_node "$NODE_LINE";;
     benchmark) benchmark;;
+    auto) auto;;
 esac
